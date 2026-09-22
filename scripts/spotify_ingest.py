@@ -18,7 +18,7 @@ def get_recently_played(access_token: str) -> None:
     response.raise_for_status()
     construct_data(response.json())
 
-def construct_data(data:dict) -> None:
+def construct_data(data: dict) -> None:
     run_id = str(uuid.uuid4())
     rows = []
     records_rejected = 0
@@ -28,6 +28,7 @@ def construct_data(data:dict) -> None:
     watermark_df = spark.table("spotify_project.metadata.pipeline_watermarks")
     most_recent_timestamp = watermark_df.select("watermark_value").collect()[0]["watermark_value"]
 
+    #most_recent_timestamp is timezone-naive, need to make timezone aware in order to do comparison
     if most_recent_timestamp.tzinfo is None:
         most_recent_timestamp = most_recent_timestamp.replace(tzinfo=timezone.utc)
 
@@ -56,17 +57,27 @@ def construct_data(data:dict) -> None:
     
     records_read = len(rows)
 
-    played_at_values = [row["played_at"] for row in rows]
-    max_played_at_dt = max([datetime.fromisoformat(played_at.replace('Z', '+00:00')) for played_at in played_at_values])
+    if rows:
+        played_at_values = [row["played_at"] for row in rows]
+        max_played_at_dt = max([datetime.fromisoformat(played_at.replace('Z', '+00:00')) for played_at in played_at_values])
+    else:
+        max_played_at_dt = most_recent_timestamp
 
-    # prefereably do atomically...somehow
-    write_to_db(rows)
-    write_to_pipeline_metadata_table(records_read, records_rejected, run_id, len(rows), start_time)
+    # Capture pre-run Delta version of watermark table for potential rollback
+    watermark_version = spark.sql("DESCRIBE HISTORY spotify_project.metadata.pipeline_watermarks").select("version").collect()[0]["version"]
 
-    # return the most recent timestamp for the watermark
-    write_to_pipeline_watermark_table(run_id, max_played_at_dt)
+    try:
+        write_to_ingest_table(rows)
+        write_to_pipeline_metadata_table(records_read, records_rejected, run_id, len(rows), start_time, most_recent_timestamp, max_played_at_dt)
+        write_to_pipeline_watermark_table(run_id, max_played_at_dt)
+        print(f"Pipeline run {run_id} completed successfully - all 3 tables written.")
+    except Exception as e:
+        print(f"Pipeline run {run_id} failed during table writes: {e}")
+        print("Initiating rollback of all table writes...")
+        rollback_tables(run_id, watermark_version)
+        raise
 
-def write_to_pipeline_metadata_table(read: int, rejected: int, run_id: str, written: int, start_time: datetime):
+def write_to_pipeline_metadata_table(read: int, rejected: int, run_id: str, written: int, start_time: datetime, previous_watermark: datetime, after_watermark: datetime) -> None:
     end_time = datetime.now(timezone.utc)
     pipeline_status = 'success'
     if written == 0:
@@ -81,15 +92,14 @@ def write_to_pipeline_metadata_table(read: int, rejected: int, run_id: str, writ
         "status": pipeline_status,
         "records_read": read,
         "records_rejected": rejected,
-        "records_written": written
+        "records_written": written,
+        "watermark_before": previous_watermark,
+        "watermark_after": after_watermark
     }]
 
-    try:
-        audit_df = spark.createDataFrame(audit_row)
-        audit_df.write.mode('append').saveAsTable("spotify_project.metadata.pipeline_runs")
-        print("Processing data -> spotify_project.metadata.pipeline_runs")
-    except:
-        print("error writing to table -> spotify_project.metadata.pipeline_runs")
+    audit_df = spark.createDataFrame(audit_row)
+    audit_df.write.mode('append').saveAsTable("spotify_project.metadata.pipeline_runs")
+    print("Processing data -> spotify_project.metadata.pipeline_runs")
 
 def write_to_pipeline_watermark_table(run_id: str, watermark_value: datetime) -> None:
     # set the watermark 15 minutes prior to the current time to account for late arriving data
@@ -98,6 +108,7 @@ def write_to_pipeline_watermark_table(run_id: str, watermark_value: datetime) ->
     source = 'spotify_api'
     updated_at = datetime.now(timezone.utc)
     watermark_column = 'played_at'
+
     row = [{
         "pipeline_name": pipeline_name,
         "source": source,
@@ -107,21 +118,47 @@ def write_to_pipeline_watermark_table(run_id: str, watermark_value: datetime) ->
         "updated_at": updated_at
     }]
 
-    try:
-        watermark_df = spark.createDataFrame(row)
-        watermark_df.write.mode('overwrite').saveAsTable("spotify_project.metadata.pipeline_watermarks")
-        print("Processing data -> spotify_project.metdata.pipeline_watermarks")
-    except:
-        print("error writing to table -> spotify_project.metadata.pipeline_watermarks")
+    watermark_df = spark.createDataFrame(row)
+    watermark_df.write.mode('overwrite').saveAsTable("spotify_project.metadata.pipeline_watermarks")
+    print("Processing data -> spotify_project.metadata.pipeline_watermarks")
+
+def write_to_ingest_table(data: dict) -> None:
+    print(f"Processing data -> spotify_project.bronze.spotify_ingest")
+    df = spark.createDataFrame(data)
+    df.write.mode('append').saveAsTable("spotify_project.bronze.spotify_ingest")
 
 
-def write_to_db(data: dict) -> None:
+def rollback_tables(run_id: str, watermark_version: int) -> None:
+    """Rollback all table writes for a given run_id and restore watermark table to pre-run version."""
+    rollback_errors = []
+
+    # Rollback bronze ingest table by run_id
     try:
-        print(f"Processing data -> spotify_project.bronze.spotify_ingest")
-        df = spark.createDataFrame(data)
-        df = df.write.mode('append').saveAsTable("spotify_project.bronze.spotify_ingest") 
-    except:
-        print("Error writing to table -> spotify_project.bronze.spotify_ingest")
+        spark.sql(f"DELETE FROM spotify_project.bronze.spotify_ingest WHERE run_id = '{run_id}'")
+        print(f"Rolled back spotify_project.bronze.spotify_ingest - deleted rows for run_id {run_id}")
+    except Exception as e:
+        rollback_errors.append(f"spotify_ingest: {e}")
+        print(f"Failed to rollback spotify_project.bronze.spotify_ingest: {e}")
+
+    # Rollback pipeline_runs table by run_id
+    try:
+        spark.sql(f"DELETE FROM spotify_project.metadata.pipeline_runs WHERE run_id = '{run_id}'")
+        print(f"Rolled back spotify_project.metadata.pipeline_runs - deleted rows for run_id {run_id}")
+    except Exception as e:
+        rollback_errors.append(f"pipeline_runs: {e}")
+        print(f"Failed to rollback spotify_project.metadata.pipeline_runs: {e}")
+
+    # Restore watermark table to pre-run Delta version
+    try:
+        spark.sql(f"RESTORE TABLE spotify_project.metadata.pipeline_watermarks TO VERSION {watermark_version}")
+        print(f"Restored spotify_project.metadata.pipeline_watermarks to version {watermark_version}")
+    except Exception as e:
+        rollback_errors.append(f"pipeline_watermarks: {e}")
+        print(f"Failed to restore spotify_project.metadata.pipeline_watermarks: {e}")
+
+    if rollback_errors:
+        raise RuntimeError(f"Rollback completed with errors: {'; '.join(rollback_errors)}")
+    print("All tables rolled back successfully.")
 
 try:
     token = Tokens()
@@ -129,3 +166,4 @@ try:
     get_recently_played(access_token)
 except Exception as e:
     print(f'Error fetching data or invalid access token: {type(e).__name__}: {str(e)}')
+    raise
