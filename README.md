@@ -21,7 +21,7 @@ flowchart LR
 
     %% Bronze Layer
     BronzeSH["bronze.streaming_history_{year}"]
-    BronzeAPI["bronze.streaming_api"]
+    BronzeAPI["bronze.spotify_ingest"]
     BronzeArtist["bronze.artist"]
     BronzeTracks["bronze.tracks"]
 
