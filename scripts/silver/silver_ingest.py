@@ -39,6 +39,9 @@ def process_rows(rows: DataFrame) -> None:
     keep_cols = [c for c in COLUMN_KEEP if c in rows.columns]
     rows = rows.select(*keep_cols)
 
+    rows = rows.dropDuplicates()
+    rows = rows.dropna(subset=["artist_name", "track_name"])
+
     # some of the columns are not present in the spotify API, there is no other way to presently retrieve them, just leave them as null
     missing_cols = [c for c in COLUMN_KEEP if c not in rows.columns]
     for col in missing_cols:
