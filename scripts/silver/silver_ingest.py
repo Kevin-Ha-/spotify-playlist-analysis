@@ -2,17 +2,6 @@ import pyspark.sql.functions as F
 from pyspark.sql import DataFrame
 from datetime import datetime
 
-
-# append to silver streaming_history table
-# perform upsert to ensure idempotency, if we simply append based on last run id we will get dupicate_records
-
-
-# album name, artist name, track name, date played are availble
-# play time, platform ,reason end, reason start, shuffle, skipped are NOT avaialble this might be a problem
-
-# intial: read from ingest bronze table and perform cleaning on entire dataset before appending to silver streaming history table
-# after: read last run id from watermark table and only pull data from ingest table that has that run id, 
-
 COLUMN_RENAME_MAP = {
     'played_at': 'date_played',
 }
