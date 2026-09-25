@@ -48,10 +48,29 @@ def process_rows(rows: DataFrame) -> None:
         rows = rows.withColumn(col, F.lit(None))
 
     try:
-        rows.write.mode("append").saveAsTable("spotify_project.silver.streaming_history")
-        print(f"processed {rows.count()} records: successfully appended to silver.streaming_history")
+        # Define merge keys
+        merge_condition = (
+            "source.album_name = target.album_name AND "
+            "source.artist_name = target.artist_name AND "
+            "source.track_name = target.track_name AND "
+            "source.date_played = target.date_played"
+        )
+
+        (
+            rows.createOrReplaceTempView("temp_streaming_history")
+        )
+        spark.sql(f"""
+            MERGE INTO spotify_project.silver.streaming_history AS target
+            USING temp_streaming_history AS source
+            ON {merge_condition}
+            WHEN MATCHED THEN
+                UPDATE SET *
+            WHEN NOT MATCHED THEN
+                INSERT *
+        """)
+        print(f"processed {rows.count()} records: successfully merged into silver.streaming_history")
     except Exception as e:
-        print(f"failed to write records to silver.streaming_history: {e}")
+        print(f"failed to merge records into silver.streaming_history: {e}")
     
     
 # start_timestamp optional, if not supplied then just process everything prior to end_timestamp
