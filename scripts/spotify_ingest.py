@@ -85,6 +85,9 @@ def write_to_pipeline_metadata_table(read: int, rejected: int, run_id: str, writ
     if rejected > 0:
         pipeline_status = 'partial'
 
+    # Add 15 minutes to previous_watermark to counteract earlier subtraction
+    previous_watermark = previous_watermark + timedelta(minutes=15)
+
     audit_row = [{
         "run_id": run_id,
         "start_time": start_time,
